@@ -17,7 +17,6 @@
     ],
     "require": {
         "php": "^8.3",
-        "ext-oci8": ">=3.0.1",
         "ext-pdo": "*",
         "illuminate/database": "^13",
         "illuminate/pagination": "^13",
@@ -36,7 +35,10 @@
     "autoload": {
         "psr-4": {
             "Yajra\\": "src/"
-        }
+        },
+        "files": [
+            "src/polyfill/polyfill.php"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
