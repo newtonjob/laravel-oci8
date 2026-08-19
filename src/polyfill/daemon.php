@@ -23,9 +23,14 @@
  * so there is never a collision between concurrent connections.
  */
 
-declare(ticks=1);
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
+
+defined('OCI_COMMIT_ON_SUCCESS') or define('OCI_COMMIT_ON_SUCCESS', 32);
+defined('OCI_NO_AUTO_COMMIT') or define('OCI_NO_AUTO_COMMIT', 0);
+defined('OCI_ASSOC') or define('OCI_ASSOC', 2);
+defined('OCI_RETURN_NULLS') or define('OCI_RETURN_NULLS', 4);
+defined('OCI_RETURN_LOBS') or define('OCI_RETURN_LOBS', 8);
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -181,7 +186,7 @@ final class OracleConnection
             return false;
         }
 
-        $ok = @oci_execute($stmt, OCI_COMMIT_ON_SUCCESS);
+        $ok = @oci_execute($stmt, OCI_NO_AUTO_COMMIT);
 
         oci_free_statement($stmt);
 
@@ -194,42 +199,20 @@ final class OracleConnection
             return;
         }
 
-        if ($this->inTransaction) {
-            oci_rollback($this->handle);
-        }
-
+        oci_rollback($this->handle);
         oci_close($this->handle);
 
         $this->handle = null;
         $this->logger->info('Oracle connection closed.');
     }
 
-    public function begin()
-    {
-        if ($this->inTransaction) {
-            return array('ok' => true, 'nested' => true);
-        }
-
-        $this->inTransaction = true;
-
-        $this->logger->debug('Transaction started.');
-
-        return array('ok' => true);
-    }
-
     public function commit()
     {
-        if (! $this->inTransaction) {
-            return array('ok' => true);
-        }
+        $this->inTransaction = false;
 
         if (! oci_commit($this->handle)) {
-            $this->inTransaction = false;
-
             return $this->ociError(oci_error($this->handle));
         }
-
-        $this->inTransaction = false;
 
         $this->logger->debug('Transaction committed.');
 
@@ -238,19 +221,12 @@ final class OracleConnection
 
     public function rollback()
     {
-        if (! $this->inTransaction) {
-            $this->logger->warn('ROLLBACK called outside a transaction.');
-
-            return array('ok' => true);
-        }
+        $this->inTransaction = false;
 
         if (! oci_rollback($this->handle)) {
-            $this->inTransaction = false;
-
             return $this->ociError(oci_error($this->handle));
         }
 
-        $this->inTransaction = false;
         $this->logger->debug('Transaction rolled back.');
 
         return array('ok' => true);
@@ -266,7 +242,7 @@ final class OracleConnection
             return $this->ociError(oci_error($this->handle), $sql);
         }
 
-        $this->bindAll($stmt, $bindings, $arrayBindings);
+        $this->bindAll($stmt, $bindings, $arrayBindings, $vars);
 
         if (! oci_execute($stmt, OCI_NO_AUTO_COMMIT)) {
             $err = oci_error($stmt);
@@ -281,23 +257,30 @@ final class OracleConnection
 
         oci_free_statement($stmt);
 
-        return array('ok' => true, 'rows' => $rows, 'columns' => $columns);
+        return array('ok' => true, 'rows' => $rows, 'columns' => $columns, 'out' => $vars);
     }
 
     public function query($sql, $bindings, $arrayBindings, $mode)
     {
-        $this->logger->debug('QUERY: '.substr($sql, 0, 200));
-
         if (! $stmt = oci_parse($this->handle, $sql)) {
             return $this->ociError(oci_error($this->handle));
         }
 
-        $this->bindAll($stmt, $bindings, $arrayBindings);
+        $this->bindAll($stmt, $bindings, $arrayBindings, $vars);
 
-        // Never auto-commit inside an active transaction regardless of what the polyfill requests
-        $execMode = ($this->inTransaction || $mode === OCI_NO_AUTO_COMMIT)
+        $execMode = ($this->inTransaction || (int) $mode === OCI_NO_AUTO_COMMIT)
             ? OCI_NO_AUTO_COMMIT
             : OCI_COMMIT_ON_SUCCESS;
+
+        if ($execMode === OCI_NO_AUTO_COMMIT) {
+            $this->inTransaction = true;
+        }
+
+        $this->logger->debug(sprintf(
+            'QUERY [%s]: %s',
+            $execMode === OCI_NO_AUTO_COMMIT ? 'no-autocommit' : 'autocommit',
+            substr($sql, 0, 200)
+        ));
 
         if (! oci_execute($stmt, $execMode)) {
             $err = oci_error($stmt);
@@ -311,7 +294,7 @@ final class OracleConnection
 
         oci_free_statement($stmt);
 
-        return array('ok' => true, 'affected' => $affected);
+        return array('ok' => true, 'affected' => $affected, 'out' => $vars);
     }
 
     public function serverVersion()
@@ -322,14 +305,17 @@ final class OracleConnection
     // ---- Private helpers ----
 
     /**
-     * Bind all parameters onto a statement.
-     * Returns $vars — must stay in scope until oci_execute completes.
+     * Bind all parameters onto a statement — $vars receives OUT values on execute.
      */
-    private function bindAll($statement, $bindings, $arrayBindings)
+    private function bindAll($statement, $bindings, $arrayBindings, &$vars)
     {
-        foreach ($bindings as $bind) {
+        $vars = array();
+
+        foreach ($bindings as $i => $bind) {
+            $vars[$i] = $bind['variable'];
+
             oci_bind_by_name(
-                $statement, $bind['bv_name'], $bind['variable'], $bind['maxlength'], $bind['type']
+                $statement, $bind['bv_name'], $vars[$i], $bind['maxlength'], $bind['type']
             );
         }
 
@@ -540,9 +526,6 @@ final class RequestDispatcher
             case 'server_version':
                 return $this->conn->serverVersion();
 
-            case 'begin':
-                return $this->conn->begin();
-
             case 'commit':
                 return $this->conn->commit();
 
@@ -593,6 +576,8 @@ final class Daemon
 
     private $running = true;
 
+    private $signalsEnabled = false;
+
     private $lastActive = 0;
 
     public function __construct(Args $args)
@@ -639,6 +624,10 @@ final class Daemon
         $idleTimeout = $this->args->int('idle', 30);
 
         while ($this->running) {
+            if ($this->signalsEnabled) {
+                pcntl_signal_dispatch();
+            }
+
             // Self-terminate if idle too long (means oci_close was never called,
             // e.g. due to a PHP fatal error in the Laravel request)
             if ($idleTimeout > 0 && (time() - $this->lastActive) >= $idleTimeout) {
@@ -679,15 +668,27 @@ final class Daemon
 
     private function listenForSignals()
     {
-        $daemon = $this;
-        $handler = function ($sig) use ($daemon) {
-            $daemon->logger->info("Signal $sig received.");
-            $daemon->running = false;
-        };
+        if (! function_exists('pcntl_signal')) {
+            $this->logger->warn('pcntl unavailable; only the idle timeout can reap this daemon.');
 
-        pcntl_signal(SIGTERM, $handler);
-        pcntl_signal(SIGINT, $handler);
-        pcntl_signal(SIGHUP, $handler);
+            return;
+        }
+
+        foreach (array(SIGTERM, SIGINT, SIGHUP) as $signal) {
+            pcntl_signal($signal, array($this, 'handleSignal'));
+        }
+
+        $this->signalsEnabled = true;
+    }
+
+    /**
+     * Ask the loop to stop after the request it is currently serving.
+     */
+    public function handleSignal($signal)
+    {
+        $this->logger->info("Signal $signal received; shutting down after the current request.");
+
+        $this->running = false;
     }
 
     public function shutdown()
