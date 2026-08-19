@@ -281,7 +281,7 @@ class Oci8BridgeConnection
         $socket = @stream_socket_client('unix://'.$socketPath, $errno, $errstr, $timeout);
 
         if (! $socket) {
-            throw new RuntimeException("Cannot connect to Oracle Bridge at '$socketPath': $errstr ($errno)");
+            throw new RuntimeException("ORA-03135: Cannot connect to Oracle Bridge at '$socketPath': $errstr ($errno)");
         }
 
         stream_set_timeout($socket, $timeout);
