@@ -69,8 +69,8 @@ class Oci8BridgeConfig
             'socket_dir' => storage_path('app/private'),
             'log' => storage_path('logs/oci.log'),
             'log_level' => self::env('OCI_LOG_LEVEL', 'info'),
-            'timeout' => (int) self::env('OCI_TIMEOUT', '5'),
-            'idle' => (int) self::env('OCI_IDLE', '5'),
+            'timeout' => (int) self::env('OCI_TIMEOUT', '30'),
+            'idle' => (int) self::env('OCI_IDLE', '30'),
             'ready_wait' => (int) self::env('OCI_READY_WAIT', '5'),
         ];
 
