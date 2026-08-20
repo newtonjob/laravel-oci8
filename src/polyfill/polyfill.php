@@ -69,8 +69,8 @@ class Oci8BridgeConfig
             'socket_dir' => storage_path('app/private'),
             'log' => storage_path('logs/oci.log'),
             'log_level' => self::env('OCI_LOG_LEVEL', 'info'),
-            'timeout' => (int) self::env('OCI_TIMEOUT', '30'),
-            'idle' => (int) self::env('OCI_IDLE', '30'),
+            'timeout' => (int) self::env('OCI_TIMEOUT', '5'),
+            'idle' => (int) self::env('OCI_IDLE', '5'),
             'ready_wait' => (int) self::env('OCI_READY_WAIT', '5'),
         ];
 
@@ -85,9 +85,6 @@ class Oci8BridgeConfig
     }
 }
 
-/**
- * An open connection: owns the daemon process, its socket, and all I/O with it.
- */
 class Oci8BridgeConnection
 {
     private const MAX_RESPONSE = 10 * 1024 * 1024;
@@ -351,9 +348,45 @@ class Oci8BridgeConnection
     }
 }
 
-/**
- * A parsed statement: accumulates bindings locally, flushes them on execute.
- */
+class Oci8BridgeBinding
+{
+    public function __construct(
+        public string $name,
+        public mixed &$variable,
+        public int $maxlength,
+        public int $type
+    ) {}
+
+    /**
+     * The wire form, with LOB descriptors flattened to their payload.
+     */
+    public function payload(): array
+    {
+        $value = $this->variable;
+
+        return [
+            'bv_name' => $this->name,
+            'variable' => $value instanceof Oci8BridgeLob ? $value->value : $value,
+            'maxlength' => $this->maxlength,
+            'type' => $this->type,
+        ];
+    }
+
+    /**
+     * Take an OUT value from the daemon back into the caller's variable.
+     */
+    public function receive(mixed $value): void
+    {
+        if ($this->variable instanceof Oci8BridgeLob) {
+            $this->variable->value = $value;
+        } elseif ($this->type === SQLT_INT && is_numeric($value)) {
+            $this->variable = (int) $value;
+        } else {
+            $this->variable = $value;
+        }
+    }
+}
+
 class Oci8BridgeStatement
 {
     private const TYPES = [
@@ -361,10 +394,8 @@ class Oci8BridgeStatement
         'ALTER', 'BEGIN', 'DECLARE', 'CALL', 'TRUNCATE', 'MERGE',
     ];
 
+    /** @var Oci8BridgeBinding[] */
     public array $bindings = [];
-
-    /** References to the bound variables, keyed like $bindings, for OUT values */
-    public array $bindRefs = [];
 
     public array $arrayBindings = [];
 
@@ -389,19 +420,9 @@ class Oci8BridgeStatement
         return in_array($keyword, self::TYPES, true) ? $keyword : 'UNKNOWN';
     }
 
-    /**
-     * The variable is kept by reference so execute() can write OUT values back into it.
-     */
     public function bind(string $name, mixed &$variable, int $maxlength, int $type): bool
     {
-        $this->bindings[] = [
-            'bv_name' => $name,
-            'variable' => $variable,
-            'maxlength' => $maxlength,
-            'type' => $type,
-        ];
-
-        $this->bindRefs[count($this->bindings) - 1] = &$variable;
+        $this->bindings[] = new Oci8BridgeBinding($name, $variable, $maxlength, $type);
 
         return true;
     }
@@ -430,8 +451,8 @@ class Oci8BridgeStatement
             $response = $this->connection->send([
                 'command' => $this->type() === 'SELECT' ? 'select' : 'query',
                 'sql' => $this->sql,
-                'bindings' => $this->resolveBindings($this->bindings),
-                'arrayBindings' => $this->resolveBindings($this->arrayBindings),
+                'bindings' => array_map(fn (Oci8BridgeBinding $bind) => $bind->payload(), $this->bindings),
+                'arrayBindings' => $this->arrayBindings,
                 'mode' => $mode,
             ]);
         } catch (RuntimeException $e) {
@@ -465,7 +486,6 @@ class Oci8BridgeStatement
         $this->rows = null;
         $this->columns = null;
         $this->bindings = [];
-        $this->bindRefs = [];
         $this->arrayBindings = [];
         $this->executed = false;
 
@@ -552,35 +572,13 @@ class Oci8BridgeStatement
     }
 
     /**
-     * Swap LOB descriptors for their payload before bindings go on the wire.
-     */
-    private function resolveBindings(array $bindings): array
-    {
-        foreach ($bindings as $key => $bind) {
-            if (($bind['variable'] ?? null) instanceof Oci8BridgeLob) {
-                $bindings[$key]['variable'] = $bind['variable']->value;
-            }
-        }
-
-        return $bindings;
-    }
-
-    /**
-     * Write OUT bind values back into the variables the caller bound.
+     * Hand each OUT value to the binding that owns the caller's variable.
      */
     private function applyOutBindings(array $out): void
     {
         foreach ($out as $key => $value) {
-            if (! array_key_exists($key, $this->bindRefs)) {
-                continue;
-            }
-
-            if ($this->bindRefs[$key] instanceof Oci8BridgeLob) {
-                $this->bindRefs[$key]->value = $value;
-            } elseif ($this->bindings[$key]['type'] === SQLT_INT && is_numeric($value)) {
-                $this->bindRefs[$key] = (int) $value;
-            } else {
-                $this->bindRefs[$key] = $value;
+            if (isset($this->bindings[$key])) {
+                $this->bindings[$key]->receive($value);
             }
         }
     }
